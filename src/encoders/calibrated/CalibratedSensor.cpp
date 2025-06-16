@@ -26,6 +26,8 @@ void CalibratedSensor::init()
 {
 	// assume wrapped sensor has already been initialized
 	this->Sensor::init(); // call superclass init
+	update();
+
 }
 
 // Retrieve the calibrated sensor angle

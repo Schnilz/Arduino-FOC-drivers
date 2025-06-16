@@ -31,7 +31,13 @@ public:
     virtual void calibrate(FOCMotor& motor, int settle_time_ms = 30);
 
     // voltage to run the calibration: user input
-    float voltage_calibration = 1;    
+    float voltage_calibration = 1;
+
+    /**
+    * init method of CaibratedSensor - call after calibration
+    */
+    virtual void init() override;
+
 protected:
 
     /**
@@ -40,10 +46,6 @@ protected:
     * the value returned. 
     */
     virtual float getSensorAngle() override;
-    /**
-    * init method of CaibratedSensor - call after calibration
-    */
-    virtual void init() override;
     /**
     * delegate instance of Sensor class
     */
