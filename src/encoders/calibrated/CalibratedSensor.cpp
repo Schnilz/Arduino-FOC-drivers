@@ -1,4 +1,5 @@
 #include "CalibratedSensor.h"
+#include "common/base_classes/FOCMotor.h"
 
 // CalibratedSensor()
 // sensor              - instance of original sensor object
@@ -136,14 +137,7 @@ void CalibratedSensor::calibrate(FOCMotor &motor, int settle_time_ms)
 	float error[samples_per_full_rotation];	         						  		  
 	memset(error, 0, samples_per_full_rotation*sizeof(float));
 
-	// Additional parameters for calibration loop
-	// total number of position to iterate through between each sampling position (to reduce jumps if LUT size is small)
-	const int intermeditate_positions = 5;		
-	// Electrical Angle increments for calibration steps 								      
-	float el_angle_increment = _2PI * pole_pairs / (samples_per_full_rotation * intermeditate_positions);
-	
-
-	// find the first guess of the motor.zero_electric_angle 
+	// find the first guess of the motor.zero_electric_angle
 	// and the sensor direction
 	// updates motor.zero_electric_angle
 	// updates motor.sensor_direction
@@ -159,18 +153,40 @@ void CalibratedSensor::calibrate(FOCMotor &motor, int settle_time_ms)
 	motor.linkSensor(this);
 	motor.linkCurrentSense(current_sense);
 
-	// Set voltage angle to zero, wait for rotor position to settle
-	// keep the motor in position while getting the initial positions
-	motor.setPhaseVoltage(1, 0, elec_angle);
+	// Switch to open-loop angle control for the calibration sweep.
+	const MotionControlType prev_controller = motor.controller;
+	const float prev_voltage_limit = motor.voltage_limit;
+	const float prev_velocity_limit = motor.velocity_limit;
+	const int prev_motor_motion_downsample = motor.motion_downsample;
+	const bool prev_motor_enabled = motor.enabled;
+	motor.controller = MotionControlType::angle_openloop;
+	motor.voltage_limit = voltage_calibration;
+	motor.velocity_limit = calibration_speed;
+  motor.motion_downsample	= 0;
+	motor.enable();
+	
+	if(motor.motor_status == FOCMotorStatus::motor_calibrating){
+		SIMPLEFOC_DEBUG("SEN_CAL: cal is already running.");
+		return;
+	}
+
+	// Start at the nearest electrical zero to avoid a long initial traversal.
+	const float mech_per_elec = _2PI / (float)pole_pairs;
+	float mech_angle = roundf(motor.shaft_angle / mech_per_elec) * mech_per_elec;
+	motor.move(mech_angle);
+	motor.loopFOC();
 	_delay(1000);
 	_wrapped.update();
 	float theta_init = _wrapped.getAngle();
 	float theta_absolute_init = _wrapped.getMechanicalAngle();
 
+	// Mechanical angle step between consecutive samples.
+	const float mech_angle_step = _2PI / (float)samples_per_full_rotation;
+
 	/*
 	Start Calibration
-	Loop over  electrical angles from 0 to pole_pairs*2PI, once forward, once backward
-	store actual position and error as compared to electrical angle
+	Loop over mechanical angles from 0 to 2PI, once forward, once backward.
+	store actual position and error as compared to commanded angle.
 	*/
 
 	/*
@@ -180,22 +196,26 @@ void CalibratedSensor::calibrate(FOCMotor &motor, int settle_time_ms)
 	float zero_angle_prev = 0.0;
 	for (int i = 0; i < samples_per_full_rotation; i++)
 	{
-		for (int j = 0; j < intermeditate_positions; j++) // move to the next location
-		{
-			_wrapped.update();
-			elec_angle += el_angle_increment;
-			motor.setPhaseVoltage(voltage_calibration, 0, elec_angle);
+		mech_angle += mech_angle_step;
+		// Ramp to the next sample position using angleOpenloop at calibration_speed.
+		while (motor.shaft_angle != mech_angle) {
+			motor.move(mech_angle);
+			motor.loopFOC();
+			_delay(1);
 		}
-
+		if(motor.monitor_downsample == 0 || i % motor.monitor_downsample == 0)
+	  	SIMPLEFOC_DEBUG("SEN_CAL: ", mech_angle);
 		// delay to settle in position before taking a position sample
 		_delay(settle_time_ms);
 		_wrapped.update();
+
+		float elec_angle = mech_angle * pole_pairs;
 		// calculate the error
 		theta_actual = (int)motor.sensor_direction * (_wrapped.getAngle() - theta_init);
-        error[i] = 0.5 * (theta_actual - elec_angle / pole_pairs);
+		error[i] = 0.5f * (theta_actual - mech_angle);
 
 		// calculate the current electrical zero angle
-		float zero_angle = ((int)motor.sensor_direction * _wrapped.getMechanicalAngle() * pole_pairs ) - (elec_angle + _PI_2);
+		float zero_angle = ((int)motor.sensor_direction * _wrapped.getMechanicalAngle() * pole_pairs) - (elec_angle + _PI_2);
 		zero_angle = _normalizeAngle(zero_angle);
 		// remove the 2PI jumps
 		if(zero_angle - zero_angle_prev > _PI){
@@ -204,14 +224,13 @@ void CalibratedSensor::calibrate(FOCMotor &motor, int settle_time_ms)
 			zero_angle = zero_angle + _2PI;
 		}
 		zero_angle_prev = zero_angle;
-		avg_elec_angle += zero_angle/samples_per_full_rotation;
+		avg_elec_angle += zero_angle / samples_per_full_rotation;
 
 #ifdef SIMPLEFOC_CALIBRATEDSENSOR_DEBUG
 		SIMPLEFOC_DEBUG(">zero:",zero_angle);
 		SIMPLEFOC_DEBUG(">zero_average:", (float)(avg_elec_angle));
 #endif
 	}
-	_delay(2000);
 
 	/*
 	backwards rotation
@@ -219,21 +238,26 @@ void CalibratedSensor::calibrate(FOCMotor &motor, int settle_time_ms)
 	SIMPLEFOC_DEBUG(motor.sensor_direction == Direction::CCW ? "SEN_CAL: Rotating: CW" : "SEN_CAL: Rotating: CCW" );
 	for (int i = samples_per_full_rotation - 1; i >= 0; i--)
 	{
-		for (int j = 0; j < intermeditate_positions; j++) // move to the next location
-		{
-			_wrapped.update();
-			elec_angle -= el_angle_increment;
-			motor.setPhaseVoltage(voltage_calibration, 0, elec_angle);
+		mech_angle -= mech_angle_step;
+		// Ramp to the next sample position using angleOpenloop at calibration_speed.
+		while (motor.shaft_angle != mech_angle) {
+			motor.move(mech_angle);
+			motor.loopFOC();
+			_delay(1);
 		}
 
+		if(motor.monitor_downsample == 0 || i % motor.monitor_downsample == 0)
+	  	SIMPLEFOC_DEBUG("SEN_CAL: ", mech_angle);
 		// delay to settle in position before taking a position sample
 		_delay(settle_time_ms);
 		_wrapped.update();
+
+		float elec_angle = mech_angle * pole_pairs;
 		// calculate the error
 		theta_actual = (int)motor.sensor_direction * (_wrapped.getAngle() - theta_init);
-        error[i] += 0.5 * (theta_actual - elec_angle / pole_pairs);
+		error[i] += 0.5f * (theta_actual - mech_angle);
 		// calculate the current electrical zero angle
-		float zero_angle = ((int)motor.sensor_direction * _wrapped.getMechanicalAngle() * pole_pairs ) - (elec_angle + _PI_2);
+		float zero_angle = ((int)motor.sensor_direction * _wrapped.getMechanicalAngle() * pole_pairs) - (elec_angle + _PI_2);
 		zero_angle = _normalizeAngle(zero_angle);
 		// remove the 2PI jumps
 		if(zero_angle - zero_angle_prev > _PI){
@@ -242,7 +266,7 @@ void CalibratedSensor::calibrate(FOCMotor &motor, int settle_time_ms)
 			zero_angle = zero_angle + _2PI;
 		}
 		zero_angle_prev = zero_angle;
-		avg_elec_angle += zero_angle/samples_per_full_rotation;
+		avg_elec_angle += zero_angle / samples_per_full_rotation;
 #ifdef SIMPLEFOC_CALIBRATEDSENSOR_DEBUG
 		SIMPLEFOC_DEBUG(">zero:", zero_angle);
 		SIMPLEFOC_DEBUG(">zero_average:",  (float)(avg_elec_angle/2.0));
@@ -253,8 +277,13 @@ void CalibratedSensor::calibrate(FOCMotor &motor, int settle_time_ms)
 	_wrapped.update();
 	float theta_absolute_post = _wrapped.getMechanicalAngle();
 
-	// done with the measurement
-	motor.setPhaseVoltage(0, 0, 0);
+	// restore controller settings
+	motor.controller = prev_controller;
+	motor.voltage_limit = prev_voltage_limit;
+	motor.velocity_limit = prev_velocity_limit;
+  motor.motion_downsample	= prev_motor_motion_downsample;
+	if(!prev_motor_enabled)
+		motor.disable();
 
 	// raw offset from initial position in absolute radians between 0-2PI
 	float raw_offset = (theta_absolute_init + theta_absolute_post) / 2;

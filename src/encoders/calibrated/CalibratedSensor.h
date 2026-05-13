@@ -48,7 +48,9 @@ public:
     void printLUT(FOCMotor& motor, Print &printer);
 
     // voltage to run the calibration: user input
-    float voltage_calibration = 1;    
+    float voltage_calibration = 1;
+    // speed to run the calibration at
+    float calibration_speed = _2PI / 2;
 protected:
 
     /**
